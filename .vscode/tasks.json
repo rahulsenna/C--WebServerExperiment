@@ -6,11 +6,14 @@
             "command": "/opt/gcc-15/bin/g++",
             "args": [
                 "-fdiagnostics-color=always",
-                "-g",
+                // "-g",
+                "-O3",
                 "--std=c++23",
-                "*.cpp",
+                "-I${workspaceFolder}/third_party/boost_unordered/include",
+                "src/*.cpp",
                 "-o",
-                "${workspaceFolder}/bin/server"
+                "${workspaceFolder}/bin/server",
+                "-luring", "-lpthread", "-lsqlite3"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"

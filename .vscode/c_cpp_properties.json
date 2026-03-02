@@ -3,7 +3,8 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**"
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/third_party/boost_unordered/include"
             ],
             "defines": [],
             "compilerPath": "/opt/gcc-15/bin/g++",
