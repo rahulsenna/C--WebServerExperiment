@@ -46,6 +46,7 @@ struct RequestContext
   EventType       type;
   ConnState       state = ConnState::ACTIVE;
   int             client_fd = -1;
+  int             index     = -1;
   size_t          bytes_done = 0;
   size_t          bytes_total = 0;
   char            buffer[BUFFER_SIZE];
@@ -58,94 +59,6 @@ struct RequestContext
     bytes_total = 0;
     client_fd = -1;
   }
-};
-
-// ============================================================
-// ConnectionPool
-// ============================================================
-
-class ConnectionPool
-{
-public:
-  explicit ConnectionPool(Arena* arena)
-  {
-    assert(arena != nullptr && "ConnectionPool requires a valid arena");
-    RequestContext* ctxs = push_array_no_zero(arena, RequestContext, MAX_CONNECTIONS);
-    assert(ctxs != nullptr && "Arena failed to allocate connection contexts");
-    for (int i = 0; i < MAX_CONNECTIONS - 1; ++i)
-      ctxs[i].next_free = &ctxs[i + 1];
-    ctxs[MAX_CONNECTIONS - 1].next_free = nullptr;
-    m_head = &ctxs[0];
-  }
-
-  ConnectionPool(const ConnectionPool&) = delete;
-  ConnectionPool& operator=(const ConnectionPool&) = delete;
-
-  RequestContext* acquire()
-  {
-    if (!m_head) { std::cerr << "Warning: connection pool exhausted\n"; return nullptr; }
-    RequestContext* ctx = m_head;
-    m_head = ctx->next_free;
-    ctx->reset();
-    assert(ctx->client_fd == -1 && "Acquired context has stale fd");
-    assert(ctx->bytes_done == 0 && "Acquired context has stale byte count");
-    return ctx;
-  }
-
-  void release(RequestContext* ctx)
-  {
-    assert(ctx != nullptr && "Releasing a null context");
-    if (ctx->client_fd >= 0) { close(ctx->client_fd); ctx->client_fd = -1; }
-    ctx->next_free = m_head;
-    m_head = ctx;
-  }
-
-private:
-  RequestContext* m_head = nullptr;
-};
-
-// ============================================================
-// ServerSocket  —  SO_REUSEPORT lets each thread own one fd
-// ============================================================
-
-class ServerSocket
-{
-public:
-  explicit ServerSocket(int port)
-  {
-    assert(port > 0 && port <= 65535 && "Invalid port number");
-
-    m_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (m_fd < 0) { perror("socket"); return; }
-
-    int opt = 1;
-    setsockopt(m_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    // Each worker thread binds its own fd to the same port.
-    // Kernel load-balances incoming connections across all fds.
-    setsockopt(m_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(m_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind");   return; }
-    if (listen(m_fd, SOMAXCONN) < 0) { perror("listen"); return; }
-    m_ok = true;
-  }
-
-  ~ServerSocket() { if (m_fd >= 0) close(m_fd); }
-
-  ServerSocket(const ServerSocket&) = delete;
-  ServerSocket& operator=(const ServerSocket&) = delete;
-  ServerSocket(ServerSocket&& o) noexcept : m_fd(o.m_fd), m_ok(o.m_ok) { o.m_fd = -1; o.m_ok = false; }
-
-  bool ok() const { return m_ok; }
-  int  fd() const { assert(m_ok && "Accessing fd of invalid ServerSocket"); return m_fd; }
-
-private:
-  int  m_fd = -1;
-  bool m_ok = false;
 };
 
 // ============================================================
@@ -209,6 +122,43 @@ struct Ring
     io_uring_sqe_set_data64(sqe, ACCEPT_TASK_ID);
   }
 
+  void register_buffers(RequestContext *ctxs, int count)
+  {
+    assert(m_ok);
+    iovec *iovecs = new iovec[count];// temporary, only needed for registration
+    for (int i = 0; i < count; ++i)
+    {
+      iovecs[i].iov_base = ctxs[i].buffer;
+      iovecs[i].iov_len  = BUFFER_SIZE;
+    };
+    int ret = io_uring_register_buffers(&ring, iovecs, count);
+    delete[] iovecs;
+    if (ret < 0)
+      std::cerr << "register_buffers failed: " << strerror(-ret) << "\n";
+  }
+
+  // Register sparse fd table — slots filled dynamically on accept
+  void register_files(int count)
+  {
+    assert(m_ok);
+    int ret = io_uring_register_files_sparse(&ring, count);
+    if (ret < 0)
+      std::cerr << "register_files failed: " << strerror(-ret) << "\n";
+  }
+
+  // Install a real fd into a registered slot
+  void update_file(int slot, int fd)
+  {
+    io_uring_register_files_update(&ring, slot, &fd, 1);
+  }
+
+  // Remove fd from registered slot
+  void remove_file(int slot)
+  {
+    int minus_one = -1;
+    io_uring_register_files_update(&ring, slot, &minus_one, 1);
+  }
+
   void add_read(RequestContext* ctx)
   {
     assert(ctx != nullptr && ctx->client_fd >= 0 && ctx->state == ConnState::ACTIVE);
@@ -216,7 +166,8 @@ struct Ring
     ctx->bytes_done = 0;
     io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
-    io_uring_prep_recv(sqe, ctx->client_fd, ctx->buffer, BUFFER_SIZE, 0);
+    io_uring_prep_read_fixed(sqe, ctx->index, ctx->buffer, BUFFER_SIZE, 0, ctx->index);
+    sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, ctx);
   }
 
@@ -226,9 +177,10 @@ struct Ring
     assert(ctx->bytes_done < (size_t)BUFFER_SIZE);
     io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
-    io_uring_prep_recv(sqe, ctx->client_fd,
+    io_uring_prep_read_fixed(sqe, ctx->index,
       ctx->buffer + ctx->bytes_done,
-      BUFFER_SIZE - ctx->bytes_done, 0);
+      BUFFER_SIZE - ctx->bytes_done, 0, ctx->index);
+    sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, ctx);
   }
 
@@ -240,9 +192,10 @@ struct Ring
     ctx->bytes_total = HTTP_RESPONSE.size();
     io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
-    io_uring_prep_send(sqe, ctx->client_fd,
+    io_uring_prep_send(sqe, ctx->index,
       HTTP_RESPONSE.data() + offset,
       HTTP_RESPONSE.size() - offset, MSG_NOSIGNAL);
+    sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, ctx);
   }
 
@@ -263,6 +216,102 @@ struct Ring
 };
 
 // ============================================================
+// ConnectionPool
+// ============================================================
+struct ConnectionPool
+{
+  RequestContext* ctxs = nullptr;
+  explicit ConnectionPool(Arena* arena)
+  {
+    assert(arena != nullptr && "ConnectionPool requires a valid arena");
+    ctxs = push_array_no_zero(arena, RequestContext, MAX_CONNECTIONS);
+    assert(ctxs != nullptr && "Arena failed to allocate connection contexts");
+    for (int i = 0; i < MAX_CONNECTIONS - 1; ++i)
+    {
+      ctxs[i].index     = i;
+      ctxs[i].next_free = &ctxs[i + 1];
+    }
+    ctxs[MAX_CONNECTIONS - 1].next_free = nullptr;
+    ctxs[MAX_CONNECTIONS - 1].index = MAX_CONNECTIONS - 1;
+    m_head = &ctxs[0];
+  }
+
+  ConnectionPool(const ConnectionPool&) = delete;
+  ConnectionPool& operator=(const ConnectionPool&) = delete;
+
+  RequestContext* acquire()
+  {
+    if (!m_head) { std::cerr << "Warning: connection pool exhausted\n"; return nullptr; }
+    RequestContext* ctx = m_head;
+    m_head = ctx->next_free;
+    ctx->reset();
+    assert(ctx->client_fd == -1 && "Acquired context has stale fd");
+    assert(ctx->bytes_done == 0 && "Acquired context has stale byte count");
+    return ctx;
+  }
+
+  void release(RequestContext *ctx, Ring &ring)
+  {
+    assert(ctx != nullptr && "Releasing a null context");
+    if (ctx->client_fd >= 0)
+    {
+      ring.remove_file(ctx->index);// unregister before closing
+      close(ctx->client_fd);
+      ctx->client_fd = -1;
+    }
+    ctx->next_free = m_head;
+    m_head = ctx;
+  }
+
+  RequestContext* m_head = nullptr;
+};
+
+// ============================================================
+// ServerSocket  —  SO_REUSEPORT lets each thread own one fd
+// ============================================================
+
+class ServerSocket
+{
+public:
+  explicit ServerSocket(int port)
+  {
+    assert(port > 0 && port <= 65535 && "Invalid port number");
+
+    m_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (m_fd < 0) { perror("socket"); return; }
+
+    int opt = 1;
+    setsockopt(m_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // Each worker thread binds its own fd to the same port.
+    // Kernel load-balances incoming connections across all fds.
+    setsockopt(m_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(m_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind");   return; }
+    if (listen(m_fd, SOMAXCONN) < 0) { perror("listen"); return; }
+    m_ok = true;
+  }
+
+  ~ServerSocket() { if (m_fd >= 0) close(m_fd); }
+
+  ServerSocket(const ServerSocket&) = delete;
+  ServerSocket& operator=(const ServerSocket&) = delete;
+  ServerSocket(ServerSocket&& o) noexcept : m_fd(o.m_fd), m_ok(o.m_ok) { o.m_fd = -1; o.m_ok = false; }
+
+  bool ok() const { return m_ok; }
+  int  fd() const { assert(m_ok && "Accessing fd of invalid ServerSocket"); return m_fd; }
+
+private:
+  int  m_fd = -1;
+  bool m_ok = false;
+};
+
+
+// ============================================================
 // Server  —  one full instance per thread
 // ============================================================
 
@@ -276,6 +325,9 @@ public:
     , m_ring(MAX_CONNECTIONS * 2)
   {
     assert(m_arena != nullptr && "Arena allocation failed");
+    // Register all connection buffers and fd table with the ring
+    m_ring.register_buffers(m_pool.ctxs, MAX_CONNECTIONS);
+    m_ring.register_files(MAX_CONNECTIONS);
   }
 
   Server(const Server&) = delete;
@@ -340,8 +392,15 @@ private:
       setsockopt(result, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
       RequestContext* ctx = m_pool.acquire();
-      if (ctx) { ctx->client_fd = result; m_ring.add_read(ctx); }
-      else { close(result); }
+      if (ctx)
+      {
+        ctx->client_fd = result;
+        m_ring.update_file(ctx->index, result);
+        m_ring.add_read(ctx);
+      } else
+      {
+        close(result);
+      }
     }
     else
     {
@@ -390,7 +449,7 @@ private:
   void on_cancel(RequestContext* ctx)
   {
     assert(ctx->state == ConnState::CLOSING);
-    m_pool.release(ctx);
+    m_pool.release(ctx, m_ring);
   }
 
   static bool request_complete(const RequestContext* ctx)
