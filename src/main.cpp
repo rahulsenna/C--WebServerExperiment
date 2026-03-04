@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <liburing.h>
 
 // ============================================================
@@ -155,57 +156,54 @@ struct Ring
 {
   explicit Ring(int queue_depth, bool use_sqpoll = false)
   {
+    io_uring_params params{};
+
     if (use_sqpoll)
     {
-      io_uring_params params{};
       params.flags = IORING_SETUP_SQPOLL;
       params.sq_thread_idle = SQ_IDLE_MS;
-      if (io_uring_queue_init_params(queue_depth, &m_ring, &params) == 0)
+      if (io_uring_queue_init_params(queue_depth, &ring, &params) == 0)
       {
+        assert((params.features & IORING_FEAT_FAST_POLL) && "Kernel too old — IORING_FEAT_FAST_POLL required");
         m_ok = true; return;
       }
       std::cerr << "SQPOLL init failed, falling back\n";
     }
-    if (io_uring_queue_init(queue_depth, &m_ring, 0) < 0)
+
+    if (io_uring_queue_init_params(queue_depth, &ring, &params) < 0)
     {
       std::cerr << "io_uring init failed\n"; return;
     }
+    assert((params.features & IORING_FEAT_FAST_POLL) && "Kernel too old — IORING_FEAT_FAST_POLL required");
     m_ok = true;
   }
-
-  // ~Ring() { if (m_ok) io_uring_queue_exit(&m_ring); }
 
   Ring(const Ring&) = delete;
   Ring& operator=(const Ring&) = delete;
 
-  bool ok()  const { return m_ok; }
+  bool ok() const { return m_ok; }
+
   enum class WaitResult { OK, TIMEOUT, ERROR };
 
   WaitResult wait(io_uring_cqe** cqe)
   {
     __kernel_timespec ts{ .tv_sec = 0, .tv_nsec = 100'000'000 };
-    int ret = io_uring_wait_cqe_timeout(&m_ring, cqe, &ts);
-    if (ret == 0)        return WaitResult::OK;
-    if (ret == -ETIME)   return WaitResult::TIMEOUT;
+    int ret = io_uring_wait_cqe_timeout(&ring, cqe, &ts);
+    if (ret == 0)      return WaitResult::OK;
+    if (ret == -ETIME) return WaitResult::TIMEOUT;
     return WaitResult::ERROR;
-  }
-
-  void seen(io_uring_cqe* cqe)
-  {
-    assert(cqe != nullptr && "Marking null CQE as seen");
-    io_uring_cqe_seen(&m_ring, cqe);
   }
 
   void submit()
   {
     assert(m_ok && "Calling submit() on invalid Ring");
-    io_uring_submit(&m_ring);
+    io_uring_submit(&ring);
   }
 
   void arm_multishot_accept(int server_fd)
   {
     assert(server_fd >= 0 && "Invalid server fd for multishot accept");
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
     io_uring_prep_multishot_accept(sqe, server_fd, nullptr, nullptr, 0);
     io_uring_sqe_set_data64(sqe, ACCEPT_TASK_ID);
@@ -213,12 +211,10 @@ struct Ring
 
   void add_read(RequestContext* ctx)
   {
-    assert(ctx != nullptr && "Null context passed to add_read");
-    assert(ctx->client_fd >= 0 && "add_read called with invalid fd");
-    assert(ctx->state == ConnState::ACTIVE && "add_read called on closing context");
+    assert(ctx != nullptr && ctx->client_fd >= 0 && ctx->state == ConnState::ACTIVE);
     ctx->type = EventType::READ;
     ctx->bytes_done = 0;
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
     io_uring_prep_recv(sqe, ctx->client_fd, ctx->buffer, BUFFER_SIZE, 0);
     io_uring_sqe_set_data(sqe, ctx);
@@ -226,10 +222,9 @@ struct Ring
 
   void resume_read(RequestContext* ctx)
   {
-    assert(ctx != nullptr && "Null context passed to resume_read");
-    assert(ctx->type == EventType::READ && "resume_read called on non-READ context");
-    assert(ctx->bytes_done < (size_t)BUFFER_SIZE && "resume_read called with full buffer");
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    assert(ctx != nullptr && ctx->type == EventType::READ);
+    assert(ctx->bytes_done < (size_t)BUFFER_SIZE);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
     io_uring_prep_recv(sqe, ctx->client_fd,
       ctx->buffer + ctx->bytes_done,
@@ -239,13 +234,11 @@ struct Ring
 
   void add_write(RequestContext* ctx, size_t offset = 0)
   {
-    assert(ctx != nullptr && "Null context passed to add_write");
-    assert(ctx->client_fd >= 0 && "add_write called with invalid fd");
-    assert(offset < HTTP_RESPONSE.size() && "Write offset exceeds response size");
-    assert(ctx->state == ConnState::ACTIVE && "add_write called on closing context");
+    assert(ctx != nullptr && ctx->client_fd >= 0 && ctx->state == ConnState::ACTIVE);
+    assert(offset < HTTP_RESPONSE.size());
     ctx->type = EventType::WRITE;
     ctx->bytes_total = HTTP_RESPONSE.size();
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
     io_uring_prep_send(sqe, ctx->client_fd,
       HTTP_RESPONSE.data() + offset,
@@ -255,18 +248,17 @@ struct Ring
 
   void begin_close(RequestContext* ctx)
   {
-    assert(ctx != nullptr && "Null context passed to begin_close");
-    assert(ctx->client_fd >= 0 && "begin_close called with invalid fd");
+    assert(ctx != nullptr && ctx->client_fd >= 0);
     if (ctx->state == ConnState::CLOSING) return;
     ctx->state = ConnState::CLOSING;
     ctx->type = EventType::CANCEL;
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     assert(sqe != nullptr && "SQ ring full");
     io_uring_prep_cancel_fd(sqe, ctx->client_fd, IORING_ASYNC_CANCEL_ALL);
     io_uring_sqe_set_data(sqe, ctx);
   }
 
-  io_uring m_ring{};
+  io_uring ring{};
   bool     m_ok = false;
 };
 
@@ -286,8 +278,6 @@ public:
     assert(m_arena != nullptr && "Arena allocation failed");
   }
 
-  // ~Server() { arena_release(m_arena); }
-
   Server(const Server&) = delete;
   Server& operator=(const Server&) = delete;
 
@@ -303,62 +293,52 @@ public:
 
     while (!g_shutdown)
     {
+      // Wait for at least one CQE
       io_uring_cqe* cqe;
       auto wait_result = m_ring.wait(&cqe);
-      if (wait_result == Ring::WaitResult::TIMEOUT) continue;  // just check g_shutdown
+      if (wait_result == Ring::WaitResult::TIMEOUT) continue;
       if (wait_result == Ring::WaitResult::ERROR)
       {
         std::cerr << "wait_cqe error\n";
         break;
       }
 
-      u64          user_data = io_uring_cqe_get_data64(cqe);
-      int          result = cqe->res;
-      unsigned int flags = cqe->flags;
-      m_ring.seen(cqe);
-
-      if (user_data == ACCEPT_TASK_ID)
-        handle_accept(result, flags);
-      else
-        handle_completion(reinterpret_cast<RequestContext*>(user_data), result);
+      // Batch drain — process ALL ready CQEs in one pass
+      unsigned head, count = 0;
+      io_uring_for_each_cqe(&m_ring.ring, head, cqe)
+      {
+        dispatch(cqe);
+        count++;
+      }
+      io_uring_cq_advance(&m_ring.ring, count);  // mark all seen at once
 
       m_ring.submit();
     }
-    drain();  // finish in-flight, then return
+
+    drain();
   }
-
-  void drain()
-  {
-    // 1. Cancel all pending client ops
-    // This generates CQEs for every in-flight recv/send
-    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring.m_ring);
-    io_uring_prep_cancel_fd(sqe, m_socket.fd(), IORING_ASYNC_CANCEL_ALL);
-    io_uring_sqe_set_data64(sqe, 0);
-    m_ring.submit();
-
-    // 2. Drain until no more CQEs
-    io_uring_cqe* cqe;
-    while (io_uring_peek_cqe(&m_ring.m_ring, &cqe) == 0)
-    {
-      if (!cqe) break;
-      u64 user_data = io_uring_cqe_get_data64(cqe);
-      io_uring_cqe_seen(&m_ring.m_ring, cqe);
-
-      if (user_data != 0 && user_data != ACCEPT_TASK_ID)
-      {
-        RequestContext* ctx = reinterpret_cast<RequestContext*>(user_data);
-        if (ctx->client_fd >= 0)
-          close(ctx->client_fd);  // sends TCP FIN to client
-      }
-    }
-  }
-
 
 private:
+  void dispatch(io_uring_cqe* cqe)
+  {
+    u64          user_data = io_uring_cqe_get_data64(cqe);
+    int          result = cqe->res;
+    unsigned int flags = cqe->flags;
+
+    if (user_data == ACCEPT_TASK_ID)
+      handle_accept(result, flags);
+    else
+      handle_completion(reinterpret_cast<RequestContext*>(user_data), result);
+  }
+
   void handle_accept(int result, unsigned int flags)
   {
     if (result >= 0)
     {
+      // Disable Nagle — don't buffer small writes, send immediately
+      int nodelay = 1;
+      setsockopt(result, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
       RequestContext* ctx = m_pool.acquire();
       if (ctx) { ctx->client_fd = result; m_ring.add_read(ctx); }
       else { close(result); }
@@ -376,20 +356,17 @@ private:
     assert(ctx != nullptr && "Null context in CQE user_data");
     switch (ctx->type)
     {
-    case EventType::READ:   on_read(ctx, result); break;
+    case EventType::READ:   on_read(ctx, result);  break;
     case EventType::WRITE:  on_write(ctx, result); break;
-    case EventType::CANCEL: on_cancel(ctx);         break;
+    case EventType::CANCEL: on_cancel(ctx);        break;
     }
   }
 
   void on_read(RequestContext* ctx, int result)
   {
-    assert(ctx->type == EventType::READ && "on_read called with wrong EventType");
     if (result <= 0) { m_ring.begin_close(ctx); return; }
-
     ctx->bytes_done += (size_t)result;
     assert(ctx->bytes_done <= (size_t)BUFFER_SIZE && "Read overflow");
-
     if (!request_complete(ctx) && ctx->bytes_done < BUFFER_SIZE)
       m_ring.resume_read(ctx);
     else
@@ -401,12 +378,9 @@ private:
 
   void on_write(RequestContext* ctx, int result)
   {
-    assert(ctx->type == EventType::WRITE && "on_write called with wrong EventType");
     if (result <= 0) { m_ring.begin_close(ctx); return; }
-
     ctx->bytes_done += (size_t)result;
     assert(ctx->bytes_done <= ctx->bytes_total && "Write overflow");
-
     if (ctx->bytes_done < ctx->bytes_total)
       m_ring.add_write(ctx, ctx->bytes_done);
     else
@@ -415,14 +389,35 @@ private:
 
   void on_cancel(RequestContext* ctx)
   {
-    assert(ctx->state == ConnState::CLOSING && "on_cancel called on non-closing context");
+    assert(ctx->state == ConnState::CLOSING);
     m_pool.release(ctx);
   }
 
   static bool request_complete(const RequestContext* ctx)
   {
-    assert(ctx->bytes_done > 0 && "request_complete called with no data");
+    assert(ctx->bytes_done > 0);
     return memmem(ctx->buffer, ctx->bytes_done, "\r\n\r\n", 4) != nullptr;
+  }
+
+  void drain()
+  {
+    io_uring_sqe* sqe = io_uring_get_sqe(&m_ring.ring);
+    io_uring_prep_cancel_fd(sqe, m_socket.fd(), IORING_ASYNC_CANCEL_ALL);
+    io_uring_sqe_set_data64(sqe, 0);
+    m_ring.submit();
+
+    io_uring_cqe* cqe;
+    while (io_uring_peek_cqe(&m_ring.ring, &cqe) == 0)
+    {
+      if (!cqe) break;
+      u64 user_data = io_uring_cqe_get_data64(cqe);
+      io_uring_cqe_seen(&m_ring.ring, cqe);
+      if (user_data != 0 && user_data != ACCEPT_TASK_ID)
+      {
+        RequestContext* ctx = reinterpret_cast<RequestContext*>(user_data);
+        if (ctx->client_fd >= 0) close(ctx->client_fd);
+      }
+    }
   }
 
   Arena* m_arena = nullptr;
